@@ -1,0 +1,19 @@
+[package]
+name = "vhost-user-input"
+version = "0.1.0"
+authors = ["Ayaan Zaidi"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc = "0.2"
+log = "0.4"
+vhost-user-backend = { git = "https://github.com/rust-vmm/vhost-user-backend" }
+vhost = { git = "https://github.com/rust-vmm/vhost", features = ["vhost-user-slave"] }
+virtio-bindings = { version = "0.1", features = ["virtio-v5_0_0"] }
+vm-virtio = { git = "https://github.com/rust-vmm/vm-virtio" }
+vmm-sys-util = "0.7"
+vm-memory = "*"
+epoll = "4.3.1"
+clap = { version = "2.33", features=["wrap_help"] }
