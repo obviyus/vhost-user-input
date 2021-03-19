@@ -11,21 +11,25 @@ use clap::{crate_authors, crate_version, App, Arg};
 use libc::EFD_NONBLOCK;
 use log::*;
 use vhost::vhost_user::message::*;
-use vhost::vhost_user::Listener;
-use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring};
-use virtio_bindings::bindings::virtio_net::*;
+use vhost::vhost_user::{Error as VhostUserError, Listener};
+use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
+use virtio_bindings::bindings::virtio_blk::VIRTIO_F_VERSION_1;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
+use vm_virtio::device::VirtioDevice;
 
 const QUEUE_SIZE: usize = 1024;
 // The guest queued an available buffer for the request queue.
 const REQ_QUEUE_EVENT: u16 = 1;
 
+type VhostUserResult<T> = std::result::Result<T, VhostUserError>;
 type Result<T> = std::result::Result<T, Error>;
 type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
 
 #[derive(Debug)]
 enum Error {
+    /// No fd provided
+    CreateNewThread,
     /// Failed to create kill eventfd
     CreateKillEventFd(io::Error),
     /// Failed to handle event other than input event.
@@ -36,7 +40,7 @@ enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "vhost_user_block_error: {:?}", self)
+        write!(f, "vhost_user_input_error: {:?}", self)
     }
 }
 
@@ -48,20 +52,37 @@ impl convert::From<Error> for io::Error {
     }
 }
 
+struct VirtIOInputEvent {
+    evt_type: u16,
+    evt_code: u16,
+    evt_value: u32,
+}
+
+
 struct VhostUserInputThread {
-    // evdevfd: int,
+    // virtio_device: VirtioDevice<>,
+    // vhost_user: ,
+    virtio_input_event: VirtIOInputEvent,
+    vring_worker: Option<Arc<VringWorker>>,
     kill_evt: EventFd,
 }
 
 impl VhostUserInputThread {
+    // Create a new virtio input device
     fn new() -> Result<Self> {
         Ok(VhostUserInputThread {
+            virtio_input_event: VirtIOInputEvent {
+                evt_type: 0,
+                evt_code: 0,
+                evt_value: 0,
+            },
+            vring_worker: None,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
         })
     }
 
-    fn process_queue(&mut self, vring: &mut Vring) -> bool {
-        true
+    fn set_vring_worker(&mut self, vring_worker: Option<Arc<VringWorker>>) {
+        self.vring_worker = vring_worker;
     }
 }
 
@@ -97,9 +118,9 @@ impl VhostUserBackend for VhostUserInputBackend {
 
     fn update_memory(
         &mut self,
-        atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> VhostUserBackendResult<()> {
-        unimplemented!()
+        Ok(())
     }
 
     fn handle_event(
@@ -109,7 +130,12 @@ impl VhostUserBackend for VhostUserInputBackend {
         vrings: &[Arc<RwLock<Vring>>],
         thread_id: usize,
     ) -> VhostUserBackendResult<bool> {
-        unimplemented!()
+        if evset != epoll::Events::EPOLLIN {
+            return Err(Error::HandleEventNotEpollIn.into());
+        }
+        debug!("event received: {:#?}", device_event);
+
+        Ok(false)
     }
 }
 
