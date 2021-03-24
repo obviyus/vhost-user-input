@@ -161,18 +161,6 @@ impl VhostUserBackend for VhostUserInputBackend {
         Ok(())
     }
 
-    // fn exit_event(&self, thread_index: usize) -> Option<(EventFd, Option<u16>)> {
-    //     // The exit event is placed after the queue, which is event index 1.
-    //     Some((
-    //         self.threads[thread_index]
-    //             .lock()
-    //             .unwrap()
-    //             .kill_evt
-    //             .try_clone().unwrap(),
-    //         Some(1),
-    //     ))
-    // }
-
     fn queues_per_thread(&self) -> Vec<u64> {
         self.queues_per_thread.clone()
     }
@@ -248,11 +236,18 @@ fn main() {
         error!("Waiting for daemon failed: {:?}", e);
     }
 
-    // let vring_workers = daemon.get_vring_workers();
+    println!("Waiting complete");
 
     for thread in input_backend.read().unwrap().threads.iter() {
-        if let Err(e) = thread.lock().unwrap().kill_evt.write(1) {
+        let kill_evt = thread
+            .lock()
+            .unwrap()
+            .kill_evt
+            .try_clone()
+            .unwrap();
+        if let Err(e) = kill_evt.write(1) {
             error!("Error shutting down worker thread: {:?}", e)
         }
+
     }
 }
