@@ -4,15 +4,16 @@ extern crate vhost;
 extern crate vhost_user_backend;
 extern crate vm_memory;
 
-use std::sync::{Arc, Mutex, RwLock};
 use std::{convert, error, fmt, io, process, result};
+use std::os::unix::io::AsRawFd;
+use std::sync::{Arc, Mutex, RwLock};
 
-use clap::{crate_authors, crate_version, App, Arg};
+use clap::{App, Arg, crate_authors, crate_version};
 use libc::EFD_NONBLOCK;
 use log::*;
-use vhost::vhost_user::message::*;
 use vhost::vhost_user::Listener;
-use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring};
+use vhost::vhost_user::message::*;
+use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
 use virtio_bindings::bindings::virtio_blk::VIRTIO_F_VERSION_1;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
@@ -47,16 +48,20 @@ impl convert::From<Error> for io::Error {
 }
 
 struct VhostUserInputThread {
-    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    input_fd: EventFd,
+    vring_worker: Option<Arc<VringWorker>>,
     event_idx: bool,
     kill_evt: EventFd,
 }
 
 impl VhostUserInputThread {
     // Create a new virtio input device
-    fn new() -> Result<Self> {
+    fn new(input_fd: EventFd) -> Result<Self> {
+        println!("new VhostUserInputThread");
+
         Ok(VhostUserInputThread {
-            mem: None,
+            input_fd,
+            vring_worker: None,
             event_idx: false,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
         })
@@ -64,17 +69,16 @@ impl VhostUserInputThread {
 
     fn process_queue(&mut self, vring: &mut Vring) -> bool {
         let mut used_any: bool = false;
-        // let mem = match self.mem.as_ref() {
-        //     Some(m) => m,
-        //     None => return false,
-        // };
-
         while let Some(_) = vring.mut_queue().iter().unwrap().next() {
             println!("got an element in the queue!");
             used_any = true;
         }
 
         used_any
+    }
+
+    fn set_vring_worker(&mut self, vring_worker: Option<Arc<VringWorker>>) {
+        self.vring_worker = vring_worker;
     }
 }
 
@@ -85,12 +89,12 @@ struct VhostUserInputBackend {
 }
 
 impl VhostUserInputBackend {
-    fn new(num_queues: usize, queue_size: usize) -> Result<Self> {
+    fn new(input_fd: EventFd, num_queues: usize, queue_size: usize) -> Result<Self> {
         let mut queues_per_thread = Vec::new();
         let mut threads = Vec::new();
 
         for i in 0..num_queues {
-            let thread = Mutex::new(VhostUserInputThread::new()?);
+            let thread = Mutex::new(VhostUserInputThread::new(input_fd.try_clone().unwrap())?);
             threads.push(thread);
             queues_per_thread.push(0b1 << i);
         }
@@ -105,14 +109,20 @@ impl VhostUserInputBackend {
 
 impl VhostUserBackend for VhostUserInputBackend {
     fn num_queues(&self) -> usize {
+        println!("num_queues");
+
         QUEUE_SIZE
     }
 
     fn max_queue_size(&self) -> usize {
+        println!("max_queue_size");
+
         self.queue_size as usize
     }
 
     fn features(&self) -> u64 {
+        println!("features");
+
         1 << VIRTIO_F_VERSION_1 | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
@@ -130,9 +140,6 @@ impl VhostUserBackend for VhostUserInputBackend {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> VhostUserBackendResult<()> {
-        for thread in self.threads.iter() {
-            thread.lock().unwrap().mem = Some(mem.clone());
-        }
         Ok(())
     }
 
@@ -167,6 +174,7 @@ impl VhostUserBackend for VhostUserInputBackend {
 }
 
 fn main() {
+    // CLI args needed for a complete vhost-user-input implementation
     let cmd_arguments = App::new("vhost user input")
         .version(crate_version!())
         .author(crate_authors!())
@@ -209,6 +217,7 @@ fn main() {
         )
         .get_matches();
 
+    // Socket on which the vhost-user-input server listens on
     let socket_path = match cmd_arguments.value_of("socket-path") {
         None => {
             panic!("no socket-path provided!")
@@ -216,10 +225,15 @@ fn main() {
         Some(path) => path,
     };
 
+    // Add a new listener on the socket-path to listen for events
     let listener = Listener::new(socket_path, true).unwrap();
+    // TODO: Implement logging
     println!("listening on {}", socket_path);
 
-    let input_backend = Arc::new(RwLock::new(VhostUserInputBackend::new(2, 1024).unwrap()));
+    // EventFd for synthetic inputs to the VhostUserInputThread
+    let sim_inputs = EventFd::new(EFD_NONBLOCK).unwrap();
+
+    let input_backend = Arc::new(RwLock::new(VhostUserInputBackend::new(sim_inputs.try_clone().unwrap(), 2, 1024).unwrap()));
     println!("VhostUserInputBackend created...");
 
     let mut daemon =
@@ -231,6 +245,17 @@ fn main() {
         process::exit(1);
     }
     println!("VhostUserDaemon started...");
+
+    // Get vring_workers from the VhostUserInputThread, register listeners on each of them for
+    // synthetic inputs EventFd created earlier
+    let vring_workers = daemon.get_vring_workers();
+    for vring_worker in vring_workers {
+        // Send dummy data for now
+        if let Err(e) = vring_worker.register_listener(sim_inputs.as_raw_fd(), epoll::Events::EPOLLIN, 0) {
+            error!("Failed to register VringWorker: {:?}", e);
+            process::exit(1)
+        }
+    }
 
     if let Err(e) = daemon.wait() {
         error!("Waiting for daemon failed: {:?}", e);
@@ -248,6 +273,5 @@ fn main() {
         if let Err(e) = kill_evt.write(1) {
             error!("Error shutting down worker thread: {:?}", e)
         }
-
     }
 }
