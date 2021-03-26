@@ -4,20 +4,29 @@ extern crate vhost;
 extern crate vhost_user_backend;
 extern crate vm_memory;
 
-use std::{convert, error, fmt, io, process, result};
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex, RwLock};
+use std::{convert, error, fmt, io, process, result};
 
-use clap::{App, Arg, crate_authors, crate_version};
+use clap::{crate_authors, crate_version, App, Arg};
 use libc::EFD_NONBLOCK;
 use log::*;
-use vhost::vhost_user::Listener;
 use vhost::vhost_user::message::*;
+use vhost::vhost_user::Listener;
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
-use virtio_bindings::bindings::virtio_blk::{VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1};
+use virtio_bindings::bindings::virtio_blk::{
+    VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
+    VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1,
+};
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
+
+use vhost_user_input::{VirtioInputAbsInfo, VirtioInputDevIDs};
+
+use crate::lib::VirtioInputConfig;
+
+mod lib;
 
 type Result<T> = std::result::Result<T, Error>;
 type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
@@ -79,7 +88,7 @@ impl VhostUserInputThread {
 
 struct VhostUserInputBackend {
     threads: Vec<Mutex<VhostUserInputThread>>,
-    config: Vec<u8>,
+    config: VirtioInputConfig,
     queues_per_thread: Vec<u64>,
     num_queues: usize,
     queue_size: usize,
@@ -97,9 +106,11 @@ impl VhostUserInputBackend {
             queues_per_thread.push(0b1 << i);
         }
 
+        let config = VirtioInputConfig::default();
+
         Ok(VhostUserInputBackend {
             threads,
-            config: vec![0],
+            config,
             queues_per_thread,
             num_queues,
             queue_size,
@@ -126,10 +137,6 @@ impl VhostUserBackend for VhostUserInputBackend {
 
         1 << VIRTIO_F_VERSION_1
             | 1 << VIRTIO_RING_F_EVENT_IDX
-            | 1 << VIRTIO_CONFIG_S_ACKNOWLEDGE
-            | 1 << VIRTIO_CONFIG_S_DRIVER
-            | 1 << VIRTIO_CONFIG_S_DRIVER_OK
-            | 1 << VIRTIO_CONFIG_S_FEATURES_OK
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
@@ -142,8 +149,7 @@ impl VhostUserBackend for VhostUserInputBackend {
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         println!("protocol_features");
 
-        VhostUserProtocolFeatures::MQ
-            | VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
@@ -183,8 +189,7 @@ impl VhostUserBackend for VhostUserInputBackend {
                 let mut vring = vrings[0].write().unwrap();
                 if thread.event_idx {
                     loop {
-                        vring
-                            .mut_queue();
+                        vring.mut_queue();
                         if !thread.process_queue(&mut vring) {
                             break;
                         }
@@ -200,13 +205,22 @@ impl VhostUserBackend for VhostUserInputBackend {
     }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
-        println!("get_config");
-
-        unimplemented!()
+        self.config.as_slice().to_vec()
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> result::Result<(), io::Error> {
         println!("set_config");
+
+        let config_slice = self.config.as_mut_slice();
+        let data_len = _buf.len() as u32;
+        let config_len = config_slice.len() as u32;
+        if _offset + data_len > config_len {
+            error!("Failed to write config space");
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let (_, right) = config_slice.split_at_mut(_offset as usize);
+        right.copy_from_slice(&_buf[..]);
 
         Ok(())
     }
@@ -278,7 +292,9 @@ fn main() {
     // EventFd for synthetic inputs to the VhostUserInputThread
     let sim_inputs = EventFd::new(EFD_NONBLOCK).unwrap();
 
-    let input_backend = Arc::new(RwLock::new(VhostUserInputBackend::new(sim_inputs.try_clone().unwrap(), 2, 1024).unwrap()));
+    let input_backend = Arc::new(RwLock::new(
+        VhostUserInputBackend::new(sim_inputs.try_clone().unwrap(), 2, 1024).unwrap(),
+    ));
     println!("VhostUserInputBackend created...");
 
     let mut daemon =
@@ -291,16 +307,16 @@ fn main() {
     }
     println!("VhostUserDaemon started...");
 
-    // Get vring_workers from the VhostUserInputThread, register listeners on each of them for
-    // synthetic inputs EventFd created earlier
-    let vring_workers = daemon.get_vring_workers();
-    for vring_worker in vring_workers {
-        // Send dummy data for now
-        if let Err(e) = vring_worker.register_listener(sim_inputs.as_raw_fd(), epoll::Events::EPOLLIN, 0) {
-            error!("Failed to register VringWorker: {:?}", e);
-            process::exit(1)
-        }
-    }
+    // // Get vring_workers from the VhostUserInputThread, register listeners on each of them for
+    // // synthetic inputs EventFd created earlier
+    // let vring_workers = daemon.get_vring_workers();
+    // for vring_worker in vring_workers {
+    //     // Send dummy data for now
+    //     if let Err(e) = vring_worker.register_listener(sim_inputs.as_raw_fd(), epoll::Events::EPOLLIN, 0) {
+    //         error!("Failed to register VringWorker: {:?}", e);
+    //         process::exit(1)
+    //     }
+    // }
 
     if let Err(e) = daemon.wait() {
         error!("Waiting for daemon failed: {:?}", e);
@@ -308,12 +324,7 @@ fn main() {
     println!("Waiting complete");
 
     for thread in input_backend.read().unwrap().threads.iter() {
-        let kill_evt = thread
-            .lock()
-            .unwrap()
-            .kill_evt
-            .try_clone()
-            .unwrap();
+        let kill_evt = thread.lock().unwrap().kill_evt.try_clone().unwrap();
         if let Err(e) = kill_evt.write(1) {
             error!("Error shutting down worker thread: {:?}", e)
         }
