@@ -4,7 +4,6 @@ extern crate vhost;
 extern crate vhost_user_backend;
 extern crate vm_memory;
 
-use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{convert, error, fmt, io, process, result};
 
@@ -14,19 +13,10 @@ use log::*;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
-use virtio_bindings::bindings::virtio_blk::{
-    VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
-    VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1,
-};
+use virtio_bindings::bindings::virtio_blk::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use vm_memory::{ByteValued, GuestMemoryAtomic, GuestMemoryMmap};
+use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
-
-use vhost_user_input::{VirtioInputAbsInfo, VirtioInputDevIDs};
-
-use crate::lib::VirtioInputConfig;
-
-mod lib;
 
 type Result<T> = std::result::Result<T, Error>;
 type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
@@ -39,6 +29,58 @@ enum Error {
     HandleEventNotEpollIn,
     /// Failed to handle unknown event.
     HandleEventUnknownEvent,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+struct VirtioInputAbsInfo {
+    min: u32,
+    max: u32,
+    fuzz: u32,
+    flat: u32,
+    res: u32,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+struct VirtioInputDevIDs {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+union U {
+    string: [char; 128],
+    bitmap: [u8; 128],
+    abs: VirtioInputAbsInfo,
+    ids: VirtioInputDevIDs,
+}
+
+impl Default for U {
+    fn default() -> Self {
+        U {
+            string: [" ".parse().unwrap(); 128],
+        }
+    }
+}
+
+#[derive(Copy, Clone, Default)]
+#[repr(C)]
+struct VirtioInputConfig {
+    pub select: u8,
+    pub subsel: u8,
+    pub size: u8,
+    pub reserved: [u8; 5],
+    pub u: U,
+}
+
+struct VirtioInputEvent {
+    event_type: u16,
+    code: u16,
+    value: u32,
 }
 
 impl fmt::Display for Error {
@@ -205,13 +247,13 @@ impl VhostUserBackend for VhostUserInputBackend {
     }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
-        self.config.as_slice().to_vec()
+        self.config.as_slice.to_vec()
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> result::Result<(), io::Error> {
         println!("set_config");
 
-        let config_slice = self.config.as_mut_slice();
+        let config_slice = self.config.to_vec();
         let data_len = _buf.len() as u32;
         let config_len = config_slice.len() as u32;
         if _offset + data_len > config_len {
