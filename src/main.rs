@@ -14,14 +14,13 @@ use log::*;
 use vhost::vhost_user::Listener;
 use vhost::vhost_user::message::*;
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
-use virtio_bindings::bindings::virtio_blk::VIRTIO_F_VERSION_1;
+use virtio_bindings::bindings::virtio_blk::{VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1};
+use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 type Result<T> = std::result::Result<T, Error>;
 type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
-
-const QUEUE_SIZE: usize = 1;
 
 #[derive(Debug)]
 enum Error {
@@ -76,16 +75,15 @@ impl VhostUserInputThread {
 
         used_any
     }
-
-    fn set_vring_worker(&mut self, vring_worker: Option<Arc<VringWorker>>) {
-        self.vring_worker = vring_worker;
-    }
 }
 
 struct VhostUserInputBackend {
     threads: Vec<Mutex<VhostUserInputThread>>,
+    config: Vec<u8>,
     queues_per_thread: Vec<u64>,
+    num_queues: usize,
     queue_size: usize,
+    acked_features: u64,
 }
 
 impl VhostUserInputBackend {
@@ -101,8 +99,11 @@ impl VhostUserInputBackend {
 
         Ok(VhostUserInputBackend {
             threads,
+            config: vec![0],
             queues_per_thread,
+            num_queues,
             queue_size,
+            acked_features: 0,
         })
     }
 }
@@ -111,7 +112,7 @@ impl VhostUserBackend for VhostUserInputBackend {
     fn num_queues(&self) -> usize {
         println!("num_queues");
 
-        QUEUE_SIZE
+        self.num_queues
     }
 
     fn max_queue_size(&self) -> usize {
@@ -123,14 +124,31 @@ impl VhostUserBackend for VhostUserInputBackend {
     fn features(&self) -> u64 {
         println!("features");
 
-        1 << VIRTIO_F_VERSION_1 | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+        1 << VIRTIO_F_VERSION_1
+            | 1 << VIRTIO_RING_F_EVENT_IDX
+            | 1 << VIRTIO_CONFIG_S_ACKNOWLEDGE
+            | 1 << VIRTIO_CONFIG_S_DRIVER
+            | 1 << VIRTIO_CONFIG_S_DRIVER_OK
+            | 1 << VIRTIO_CONFIG_S_FEATURES_OK
+            | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+    }
+
+    fn acked_features(&mut self, features: u64) {
+        println!("acked_features");
+
+        self.acked_features = features;
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        VhostUserProtocolFeatures::STATUS | VhostUserProtocolFeatures::MQ
+        println!("protocol_features");
+
+        VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::CONFIG
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
+        println!("set_event_idx");
+
         for thread in self.threads.iter() {
             thread.lock().unwrap().event_idx = enabled;
         }
@@ -138,8 +156,10 @@ impl VhostUserBackend for VhostUserInputBackend {
 
     fn update_memory(
         &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> VhostUserBackendResult<()> {
+        println!("update_memory");
+
         Ok(())
     }
 
@@ -150,25 +170,50 @@ impl VhostUserBackend for VhostUserInputBackend {
         vrings: &[Arc<RwLock<Vring>>],
         thread_id: usize,
     ) -> VhostUserBackendResult<bool> {
+        println!("handle event");
+
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
         }
-        println!("event received: {:#?}", device_event);
 
-        Ok(false)
+        println!("event received: {:#?}", device_event);
+        let mut thread = self.threads[thread_id].lock().unwrap();
+        match device_event {
+            0 => {
+                let mut vring = vrings[0].write().unwrap();
+                if thread.event_idx {
+                    loop {
+                        vring
+                            .mut_queue();
+                        if !thread.process_queue(&mut vring) {
+                            break;
+                        }
+                    }
+                } else {
+                    thread.process_queue(&mut vring);
+                }
+
+                Ok(false)
+            }
+            _ => Err(Error::HandleEventUnknownEvent.into()),
+        }
     }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
-        println!("get_config() called");
-        Vec::new()
+        println!("get_config");
+
+        unimplemented!()
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> result::Result<(), io::Error> {
-        println!("sett_config() called");
+        println!("set_config");
+
         Ok(())
     }
 
     fn queues_per_thread(&self) -> Vec<u64> {
+        println!("queues_per_thread");
+
         self.queues_per_thread.clone()
     }
 }
@@ -260,7 +305,6 @@ fn main() {
     if let Err(e) = daemon.wait() {
         error!("Waiting for daemon failed: {:?}", e);
     }
-
     println!("Waiting complete");
 
     for thread in input_backend.read().unwrap().threads.iter() {
@@ -274,4 +318,6 @@ fn main() {
             error!("Error shutting down worker thread: {:?}", e)
         }
     }
+    println!("Worked threads closed.");
+    process::exit(0);
 }
