@@ -247,13 +247,13 @@ impl VhostUserBackend for VhostUserInputBackend {
     }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
-        self.config.as_slice.to_vec()
+        self.config.as_slice().to_vec()
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> result::Result<(), io::Error> {
         println!("set_config");
 
-        let config_slice = self.config.to_vec();
+        let mut config_slice = self.config.as_mut_slice().to_vec();
         let data_len = _buf.len() as u32;
         let config_len = config_slice.len() as u32;
         if _offset + data_len > config_len {
