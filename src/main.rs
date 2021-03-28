@@ -14,7 +14,6 @@ use vhost::vhost_user::message::*;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
 use virtio_bindings::bindings::virtio_blk::VIRTIO_F_VERSION_1;
-use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -30,6 +29,28 @@ enum Error {
     /// Failed to handle unknown event.
     HandleEventUnknownEvent,
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "vhost_user_input_error: {:?}", self)
+    }
+}
+
+impl error::Error for Error {}
+
+impl convert::From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        io::Error::new(io::ErrorKind::Other, e)
+    }
+}
+
+// const VIRTIO_INPUT_CFG_UNSET: u32 = 0x00;
+const VIRTIO_INPUT_CFG_ID_NAME: u32 = 0x01;
+const VIRTIO_INPUT_CFG_ID_SERIAL: u32 = 0x02;
+const VIRTIO_INPUT_CFG_ID_DEVIDS: u32 = 0x03;
+const VIRTIO_INPUT_CFG_PROP_BITS: u32 = 0x10;
+const VIRTIO_INPUT_CFG_EV_BITS: u32 = 0x11;
+const VIRTIO_INPUT_CFG_ABS_INFO: u32 = 0x12;
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
@@ -51,30 +72,16 @@ struct VirtioInputDevIDs {
 }
 
 #[derive(Copy, Clone)]
-#[repr(C)]
-union U {
+#[repr(C, packed)]
+struct VirtioInputConfig {
+    select: u8,
+    subsel: u8,
+    size: u8,
+    reserved: [u8; 5],
     string: [char; 128],
     bitmap: [u8; 128],
     abs: VirtioInputAbsInfo,
     ids: VirtioInputDevIDs,
-}
-
-impl Default for U {
-    fn default() -> Self {
-        U {
-            string: [" ".parse().unwrap(); 128],
-        }
-    }
-}
-
-#[derive(Copy, Clone, Default)]
-#[repr(C)]
-struct VirtioInputConfig {
-    pub select: u8,
-    pub subsel: u8,
-    pub size: u8,
-    pub reserved: [u8; 5],
-    pub u: U,
 }
 
 struct VirtioInputEvent {
@@ -83,22 +90,8 @@ struct VirtioInputEvent {
     value: u32,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "vhost_user_input_error: {:?}", self)
-    }
-}
-
-impl error::Error for Error {}
-
-impl convert::From<Error> for io::Error {
-    fn from(e: Error) -> Self {
-        io::Error::new(io::ErrorKind::Other, e)
-    }
-}
-
 struct VhostUserInputThread {
-    input_fd: EventFd,
+    // input_fd: EventFd,
     vring_worker: Option<Arc<VringWorker>>,
     event_idx: bool,
     kill_evt: EventFd,
@@ -110,7 +103,7 @@ impl VhostUserInputThread {
         println!("new VhostUserInputThread");
 
         Ok(VhostUserInputThread {
-            input_fd,
+            // input_fd,
             vring_worker: None,
             event_idx: false,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
@@ -129,36 +122,42 @@ impl VhostUserInputThread {
 }
 
 struct VhostUserInputBackend {
-    threads: Vec<Mutex<VhostUserInputThread>>,
+    thread: Mutex<VhostUserInputThread>,
     config: VirtioInputConfig,
     queues_per_thread: Vec<u64>,
     num_queues: usize,
     queue_size: usize,
-    acked_features: u64,
 }
 
 impl VhostUserInputBackend {
     fn new(input_fd: EventFd, num_queues: usize, queue_size: usize) -> Result<Self> {
         let mut queues_per_thread = Vec::new();
-        let mut threads = Vec::new();
 
-        for i in 0..num_queues {
-            let thread = Mutex::new(VhostUserInputThread::new(input_fd.try_clone().unwrap())?);
-            threads.push(thread);
-            queues_per_thread.push(0b1 << i);
-        }
+        let thread = Mutex::new(VhostUserInputThread::new(input_fd.try_clone().unwrap())?);
 
-        let config = VirtioInputConfig::default();
+        let config = VirtioInputConfig {
+            select: 0,
+            subsel: 0,
+            size: 0,
+            reserved: [0; 5],
+            string: ['x'; 128],
+            bitmap: [0; 128],
+            abs: Default::default(),
+            ids: Default::default(),
+        };
 
         Ok(VhostUserInputBackend {
-            threads,
+            thread,
             config,
             queues_per_thread,
             num_queues,
             queue_size,
-            acked_features: 0,
         })
     }
+}
+
+unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
+    ::std::slice::from_raw_parts((p as *const T) as *const u8, ::std::mem::size_of::<T>())
 }
 
 impl VhostUserBackend for VhostUserInputBackend {
@@ -178,28 +177,25 @@ impl VhostUserBackend for VhostUserInputBackend {
         println!("features");
 
         1 << VIRTIO_F_VERSION_1
-            | 1 << VIRTIO_RING_F_EVENT_IDX
+            | 1 << VIRTIO_INPUT_CFG_ID_NAME
+            | 1 << VIRTIO_INPUT_CFG_ID_SERIAL
+            | 1 << VIRTIO_INPUT_CFG_ID_DEVIDS
+            | 1 << VIRTIO_INPUT_CFG_PROP_BITS
+            | 1 << VIRTIO_INPUT_CFG_EV_BITS
+            | 1 << VIRTIO_INPUT_CFG_ABS_INFO
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
-    }
-
-    fn acked_features(&mut self, features: u64) {
-        println!("acked_features");
-
-        self.acked_features = features;
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         println!("protocol_features");
 
-        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::CONFIG
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
         println!("set_event_idx");
 
-        for thread in self.threads.iter() {
-            thread.lock().unwrap().event_idx = enabled;
-        }
+        self.thread.lock().unwrap().event_idx = enabled;
     }
 
     fn update_memory(
@@ -225,7 +221,7 @@ impl VhostUserBackend for VhostUserInputBackend {
         }
 
         println!("event received: {:#?}", device_event);
-        let mut thread = self.threads[thread_id].lock().unwrap();
+        let mut thread = self.thread.lock().unwrap();
         match device_event {
             0 => {
                 let mut vring = vrings[0].write().unwrap();
@@ -247,22 +243,25 @@ impl VhostUserBackend for VhostUserInputBackend {
     }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
-        self.config.as_slice().to_vec()
+        println!("get config!");
+
+        // unsafe { any_as_u8_slice(self.config.borrow()).to_vec() }
+        Vec::new()
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> result::Result<(), io::Error> {
         println!("set_config");
 
-        let mut config_slice = self.config.as_mut_slice().to_vec();
-        let data_len = _buf.len() as u32;
-        let config_len = config_slice.len() as u32;
-        if _offset + data_len > config_len {
-            error!("Failed to write config space");
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
+        // let mut config_slice = unsafe { any_as_u8_slice(self.config.borrow()) }.to_vec();
+        // let data_len = _buf.len() as u32;
+        // let config_len = config_slice.len() as u32;
+        // if _offset + data_len > config_len {
+        //     error!("Failed to write config space");
+        //     return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        // }
 
-        let (_, right) = config_slice.split_at_mut(_offset as usize);
-        right.copy_from_slice(&_buf[..]);
+        // let (_, right) = config_slice.split_at_mut(_offset as usize);
+        // right.copy_from_slice(&_buf[..]);
 
         Ok(())
     }
@@ -299,8 +298,8 @@ fn main() {
                 .long("socket-path")
                 .help("vhost-user socket path")
                 .takes_value(true)
-                .min_values(1)
-                .required(true),
+                .min_values(1),
+            // .required(true),
         )
         .arg(
             Arg::with_name("fd")
@@ -319,23 +318,24 @@ fn main() {
         .get_matches();
 
     // Socket on which the vhost-user-input server listens on
-    let socket_path = match cmd_arguments.value_of("socket-path") {
-        None => {
-            panic!("no socket-path provided!")
-        }
-        Some(path) => path,
-    };
+    // let socket_path = match cmd_arguments.value_of("socket-path") {
+    //     None => {
+    //         panic!("no socket-path provided!")
+    //     }
+    //     Some(path) => path,
+    // };
 
     // Add a new listener on the socket-path to listen for events
-    let listener = Listener::new(socket_path, true).unwrap();
+    // ** Hard-coded socket for debugging ** 
+    let listener = Listener::new("/tmp/vinput.sock", true).unwrap();
     // TODO: Implement logging
-    println!("listening on {}", socket_path);
+    println!("listening on {}", "/tmp/vinput.sock");
 
     // EventFd for synthetic inputs to the VhostUserInputThread
     let sim_inputs = EventFd::new(EFD_NONBLOCK).unwrap();
 
     let input_backend = Arc::new(RwLock::new(
-        VhostUserInputBackend::new(sim_inputs.try_clone().unwrap(), 2, 1024).unwrap(),
+        VhostUserInputBackend::new(sim_inputs.try_clone().unwrap(), 1, 1024).unwrap(),
     ));
     println!("VhostUserInputBackend created...");
 
@@ -365,12 +365,19 @@ fn main() {
     }
     println!("Waiting complete");
 
-    for thread in input_backend.read().unwrap().threads.iter() {
-        let kill_evt = thread.lock().unwrap().kill_evt.try_clone().unwrap();
-        if let Err(e) = kill_evt.write(1) {
-            error!("Error shutting down worker thread: {:?}", e)
-        }
+    let kill_evt = input_backend
+        .read()
+        .unwrap()
+        .thread
+        .lock()
+        .unwrap()
+        .kill_evt
+        .try_clone()
+        .unwrap();
+    if let Err(e) = kill_evt.write(1) {
+        error!("Error shutting down worker thread: {:?}", e)
     }
+
     println!("Worked threads closed.");
     process::exit(0);
 }
