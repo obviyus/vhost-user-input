@@ -10,6 +10,8 @@ use std::{convert, error, fmt, io, process, result};
 use clap::{crate_authors, crate_version, App, Arg};
 use libc::EFD_NONBLOCK;
 use log::*;
+use std::borrow::Borrow;
+use std::os::unix::io::AsRawFd;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, Vring, VringWorker};
@@ -91,7 +93,7 @@ struct VirtioInputEvent {
 }
 
 struct VhostUserInputThread {
-    // input_fd: EventFd,
+    input_fd: EventFd,
     vring_worker: Option<Arc<VringWorker>>,
     event_idx: bool,
     kill_evt: EventFd,
@@ -103,7 +105,7 @@ impl VhostUserInputThread {
         println!("new VhostUserInputThread");
 
         Ok(VhostUserInputThread {
-            // input_fd,
+            input_fd,
             vring_worker: None,
             event_idx: false,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
@@ -131,7 +133,7 @@ struct VhostUserInputBackend {
 
 impl VhostUserInputBackend {
     fn new(input_fd: EventFd, num_queues: usize, queue_size: usize) -> Result<Self> {
-        let mut queues_per_thread = Vec::new();
+        let queues_per_thread = Vec::new();
 
         let thread = Mutex::new(VhostUserInputThread::new(input_fd.try_clone().unwrap())?);
 
@@ -156,6 +158,7 @@ impl VhostUserInputBackend {
     }
 }
 
+// Helper fn to convert VirtioInputConfig structs to &[u8]
 unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     ::std::slice::from_raw_parts((p as *const T) as *const u8, ::std::mem::size_of::<T>())
 }
@@ -243,25 +246,24 @@ impl VhostUserBackend for VhostUserInputBackend {
     }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
-        println!("get config!");
+        println!("get config");
 
-        // unsafe { any_as_u8_slice(self.config.borrow()).to_vec() }
-        Vec::new()
+        unsafe { any_as_u8_slice(self.config.borrow()).to_vec() }
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> result::Result<(), io::Error> {
         println!("set_config");
 
-        // let mut config_slice = unsafe { any_as_u8_slice(self.config.borrow()) }.to_vec();
-        // let data_len = _buf.len() as u32;
-        // let config_len = config_slice.len() as u32;
-        // if _offset + data_len > config_len {
-        //     error!("Failed to write config space");
-        //     return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        // }
+        let mut config_slice = unsafe { any_as_u8_slice(self.config.borrow()) }.to_vec();
+        let data_len = _buf.len() as u32;
+        let config_len = config_slice.len() as u32;
+        if _offset + data_len > config_len {
+            error!("Failed to write config space");
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
 
-        // let (_, right) = config_slice.split_at_mut(_offset as usize);
-        // right.copy_from_slice(&_buf[..]);
+        let (_, right) = config_slice.split_at_mut(_offset as usize);
+        right.copy_from_slice(&_buf[..]);
 
         Ok(())
     }
@@ -298,8 +300,8 @@ fn main() {
                 .long("socket-path")
                 .help("vhost-user socket path")
                 .takes_value(true)
-                .min_values(1),
-            // .required(true),
+                .min_values(1)
+                .required(true),
         )
         .arg(
             Arg::with_name("fd")
@@ -318,18 +320,17 @@ fn main() {
         .get_matches();
 
     // Socket on which the vhost-user-input server listens on
-    // let socket_path = match cmd_arguments.value_of("socket-path") {
-    //     None => {
-    //         panic!("no socket-path provided!")
-    //     }
-    //     Some(path) => path,
-    // };
+    let socket_path = match cmd_arguments.value_of("socket-path") {
+        None => {
+            panic!("no socket-path provided!")
+        }
+        Some(path) => path,
+    };
 
     // Add a new listener on the socket-path to listen for events
-    // ** Hard-coded socket for debugging ** 
-    let listener = Listener::new("/tmp/vinput.sock", true).unwrap();
+    let listener = Listener::new(socket_path, true).unwrap();
     // TODO: Implement logging
-    println!("listening on {}", "/tmp/vinput.sock");
+    println!("listening on {}", socket_path);
 
     // EventFd for synthetic inputs to the VhostUserInputThread
     let sim_inputs = EventFd::new(EFD_NONBLOCK).unwrap();
@@ -349,16 +350,18 @@ fn main() {
     }
     println!("VhostUserDaemon started...");
 
-    // // Get vring_workers from the VhostUserInputThread, register listeners on each of them for
-    // // synthetic inputs EventFd created earlier
-    // let vring_workers = daemon.get_vring_workers();
-    // for vring_worker in vring_workers {
-    //     // Send dummy data for now
-    //     if let Err(e) = vring_worker.register_listener(sim_inputs.as_raw_fd(), epoll::Events::EPOLLIN, 0) {
-    //         error!("Failed to register VringWorker: {:?}", e);
-    //         process::exit(1)
-    //     }
-    // }
+    // Get vring_workers from the VhostUserInputThread, register listeners on each of them for
+    // synthetic inputs EventFd created earlier
+    let vring_workers = daemon.get_vring_workers();
+    for vring_worker in vring_workers {
+        // Send dummy data for now
+        if let Err(e) =
+            vring_worker.register_listener(sim_inputs.as_raw_fd(), epoll::Events::EPOLLIN, 0)
+        {
+            error!("Failed to register VringWorker: {:?}", e);
+            process::exit(1)
+        }
+    }
 
     if let Err(e) = daemon.wait() {
         error!("Waiting for daemon failed: {:?}", e);

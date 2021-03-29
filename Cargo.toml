@@ -17,7 +17,3 @@ vmm-sys-util = "0.7"
 vm-memory = "*"
 epoll = "4.3.1"
 clap = { version = "2.33", features=["wrap_help"] }
-
-[profile.dev]
-opt-level = 0  # Controls the --opt-level the compiler builds with
-debug = true   # Controls whether the compiler passes `-g`

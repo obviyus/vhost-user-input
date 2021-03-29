@@ -6,7 +6,10 @@ Proof-of-Concept port of vhost-user-input written in Rust
 - `vhost-user-input` successfully launches a `VhostUserDaemon` and implements `VhostUserInputBackend`
 - Can also be identified through QEMU
     - QEMU is able to ping the `features()` and `protocol_features()` methods
-    - Execution ends after that with error: `cannot set/get config space`
+    - QEMU is successfully able to invoke `get_config()` and `set_config()` methods on the `vhost-user-input` device
+    - Following the above, execution fails due to: `qemu-kvm: Received bad msg size` 
+      - most likely due to either invalid `VirtioInputConfig` default values
+      - or due to how the structs are converted to a slice through `std::slice::as_raw_parts`
 
 # References:
 - https://patchwork.ozlabs.org/project/qemu-devel/cover/20180713130916.4153-1-marcandre.lureau@redhat.com/
